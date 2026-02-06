@@ -20,21 +20,23 @@ if not OPENAI_API_KEY:
 HEADERS = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 MODELS = ["gpt-4.1-mini", "gpt-4.1"]
 
-STEP_RE = re.compile(r"^Step\s+(\d+):", re.I | re.M)
+STEP_RE = re.compile(r"^\s*Step\s*(\d+)\s*[:\.]", re.I | re.M)
 REF_RE = re.compile(r"\b(?:fact\s*\d+|int\s*\d+|assump\s*\d+)\b", re.I)
 # REFLINE_RE = re.compile(r"(fact\s*\d+|int\s*\d+|assump\s*\d+)\s*:\s*(.+)", re.I)
 HYP_INLINE = re.compile(r"hypothesis[^:\n]*:\s*(.+)", re.I)
 HYP_NEXT = re.compile(r"hypothesis[^:\n]*$", re.I)
 
-FALL_FACT = re.compile(r"\b(fact\d+)\s*:\s*(.+)", re.I)
-FALL_HYP = re.compile(r"hypothesis\s*:\s*(.+)", re.I)
+FALL_FACT = re.compile(r"\b(fact\s*\d+|int\s*\d+|assump\s*\d+)\s*:\s*(.+)", re.I)
+FALL_HYP = re.compile(r"\b(hypothesis)\s*:\s*(.+)", re.I)
+# Reference "definition" fragments, possibly multiple per line separated by ';'
+# Allows optional bullet prefix per fragment.
 REFLINE_RE = re.compile(
-    r"(fact\s*\d+|int\s*\d+|assump\s*\d+)\s*:\s*(.+?)(?=$|[;])",
-    re.I
+    r"(?:^|;)\s*(?:[-*•]\s*)?(fact\s*\d+|int\s*\d+|assump\s*\d+)\b\s*:\s*(.+?)(?=$|;)",
+    re.I,
 )
 STEP_PREFIX = re.compile(r"^\s*step\s+\d+\s*:\s*", re.I)
 INLINE_REF_RE = re.compile(
-    r"(fact\s*\d+|int\s*\d+|assump\s*\d+)\s*:\s*([^.;\n]+)",
+    r"\b(fact\s*\d+|int\s*\d+|assump\s*\d+)\b\s*:\s*([^.;\n]+)",
     re.I
 )
 
@@ -101,22 +103,18 @@ def _parse_fallback(txt: str):
     if txt.startswith(","):
         txt = txt[1:].lstrip()
     ref = {}
-    for seg in re.split(r"[.;]", txt):
+    for seg in re.split(r"[;\n\.]", txt):
         seg = seg.strip()
         if not seg:
             continue
         if (mf := FALL_FACT.match(seg)):
-            ref[mf.group(1).lower()] = mf.group(2).strip()
+            key = mf.group(1).lower().replace(" ", "")
+            ref[key] = mf.group(2).strip()
             continue
-        if (mh := FALL_HYP.search(seg)):
-            ref["hypothesis"] = mh.group(1).strip()
+        if (mh := FALL_HYP.match(seg)):
+            ref["hypothesis"] = mh.group(2).strip()
     return ref
 
-
-INLINE_REF_RE = re.compile(
-    r"(fact\s*\d+|int\s*\d+|assump\s*\d+)\s*:\s*([^.;\n]+)",
-    re.I
-)
 
 def build_ref_dict(sample):
     txt = sample["responses"][0]["response"]
@@ -124,8 +122,11 @@ def build_ref_dict(sample):
 
     # Fast line-starting extraction (keep original logic)
     for ln in txt.splitlines():
-        if (m := REFLINE_RE.match(ln.strip())):
-            ref[m.group(1).lower().replace(" ", "")] = m.group(2).strip()
+        for m in REFLINE_RE.finditer(ln):
+            key = m.group(1).lower().replace(" ", "")
+            val = m.group(2).strip()
+            if key not in ref and val:
+                ref[key] = val
 
     # Extract hypothesis
     if (h := _extract_hypothesis(txt)):
@@ -145,7 +146,6 @@ def build_ref_dict(sample):
     return ref
 
 
-STEP_RE = re.compile(r"^(?:step\s*)?(\d+)\s*[:\.]", re.I | re.M)
 INLINE_CONCL_RE = re.compile(r"\b(int\s*\d+|assump\s*\d+|hypothesis)\s*[:\.]", re.I)
 SPLIT_DELIMS = [r";", r"\n", r"\."]      # semicolon → newline → period
 
@@ -344,10 +344,21 @@ async def run_pipeline(inp, det, summ, concurrency=50):
     results = [None] * len(dataset)
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [analyse_sample(session, sample, sid) for sid, sample in enumerate(dataset)]
+        async def _run_one(sid, sample):
+            try:
+                return await analyse_sample(session, sample, sid)
+            except Exception as exc:
+                return {"sample_id": sid, "error": str(exc)[:120]}
+
+        tasks = [_run_one(sid, sample) for sid, sample in enumerate(dataset)]
         pbar = tqdm(total=len(tasks), desc="Processing samples", unit="sample")
-        for idx, coro in enumerate(asyncio.as_completed(tasks)):
-            results[idx] = await coro
+        for coro in asyncio.as_completed(tasks):
+            res = await coro
+            sid = res.get("sample_id")
+            if isinstance(sid, int) and 0 <= sid < len(results):
+                results[sid] = res
+            else:
+                results.append(res)
             pbar.update(1)
         pbar.close()
 
